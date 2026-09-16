@@ -1,0 +1,38 @@
+name: Keepalive
+
+# GitHub automatically disables scheduled workflows (cron) after 60 days
+# with no repository activity/commits. This workflow makes a trivial
+# commit well inside that window so scrape.yml never gets silently
+# switched off.
+
+on:
+  schedule:
+    - cron: "0 6 1,15 * *"   # twice a month — 1st and 15th, 06:00 UTC
+  workflow_dispatch: {}        # manual trigger too
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Touch keepalive file
+        run: |
+          mkdir -p .github
+          echo "Last keepalive: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .github/keepalive.txt
+
+      - name: Commit keepalive file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive.txt
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "chore: keepalive [skip ci]"
+            git push
+          fi
