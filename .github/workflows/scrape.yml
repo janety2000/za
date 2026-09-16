@@ -1,0 +1,90 @@
+name: MyJobMag Scraper
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes — each run only does a small
+                              # page chunk now, so it needs to run more often
+                              # to work through the backlog in reasonable time
+  workflow_dispatch: {}       # allows manual "Run workflow" trigger too
+
+# Needed so the job can commit processed.csv / current_page.txt back to the repo
+permissions:
+  contents: write
+
+concurrency:
+  group: myjobmag-scraper
+  cancel-in-progress: false   # never kill a run mid-scrape; queue instead
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25       # a chunked run (PAGES_PER_RUN pages) should
+                               # comfortably finish well inside this; raise
+                               # PAGES_PER_RUN and this together if you want
+                               # bigger chunks per run
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Guards against a known workflow_dispatch quirk: the commit checked
+      # out above is pinned to whatever HEAD was at the moment the run was
+      # DISPATCHED, not when it actually starts executing. If you trigger a
+      # second run before an earlier one's commit step has landed, the
+      # `concurrency` block will correctly queue it to run afterward — but
+      # it can still be sitting on the pre-commit snapshot. This makes sure
+      # we're on the true latest tip right before scraping, regardless.
+      - name: Pull latest changes
+        run: git pull --ff-only origin "${{ github.ref_name }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          WP_BASE_URL: ${{ secrets.WP_BASE_URL }}
+          WP_USERNAME: ${{ secrets.WP_USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          PAGES_PER_RUN: "15"    # pages walked per invocation; tune to taste
+          MAX_RUN_SECONDS: "1080" # 18 min — stop cleanly well before the
+                                   # 25-min job timeout below, so the run
+                                   # always exits normally and the commit
+                                   # step always has real progress to push
+        run: python myjobmag_scraper.py
+
+      # Persist processed.csv AND current_page.txt so the NEXT scheduled run
+      # knows what's already been posted, and which page to resume from —
+      # no duplicates, and no starting over from page 10800 every time.
+      #
+      # if: always() is critical here: if the previous step is cancelled by
+      # timeout-minutes (or fails for any other reason), GitHub skips all
+      # remaining steps by default. Without this, a timed-out run would do
+      # real work, update the files on the runner's disk, and then throw
+      # all of it away because it never got committed — silently resetting
+      # progress back to whatever the last SUCCESSFUL run committed.
+      - name: Commit progress files
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add processed.csv current_page.txt
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update scraper progress [skip ci]"
+            if ! git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "❌ git push FAILED — progress from this run will NOT persist to the next run."
+              echo "   Most likely cause: Settings → Actions → General → Workflow permissions"
+              echo "   is set to 'Read repository contents permission' instead of"
+              echo "   'Read and write permissions'. Fix that setting and re-run."
+              exit 1
+            fi
+            echo "✅ Progress committed and pushed."
+          fi
